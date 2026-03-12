@@ -1,0 +1,266 @@
+---
+name: videobob
+description: End-to-end TikTok/YouTube Shorts science video production. Stage-gated workflow with human approval at every step. Script → voice-over → AI images → Sora-2 video → stitched MP4.
+version: 1.1.0
+requiredEnv:
+  - OPENAI_API_KEY
+permissions:
+  - network: OpenAI API for image generation, TTS, and Sora-2 video
+  - filesystem: Read/write video assets in the skill working directory
+  - exec: ffmpeg and ffprobe for video processing
+source:
+  author: Clawbob51
+  github: https://github.com/Clawbob51/videobob
+security:
+  note: All API calls go directly to the official OpenAI API using YOUR key. No data is sent anywhere else.
+---
+
+# Videobob
+
+End-to-end short-form science video production for OpenClaw agents.
+
+Produces polished 9:16 videos (6 scenes, ~24-30s total) with AI images, voice-over, animated video clips, and optional CTA outro.
+
+## Prerequisites check (run before first use)
+
+Before starting, verify:
+```bash
+# All four must succeed:
+echo $OPENAI_API_KEY | head -c 5    # Should print "sk-..."
+ffmpeg -version | head -1            # Must be installed
+ffprobe -version | head -1           # Must be installed (comes with ffmpeg)
+node --version                       # Must be >= 18
+python3 -c "from PIL import Image; print('Pillow OK')"  # Must print "Pillow OK"
+```
+
+If `Pillow` is missing: `pip3 install Pillow`
+
+## Run directory (important)
+
+Every video gets its own run directory. ALL files for a single video live here.
+The stitch script expects this exact layout:
+
+```
+runs/<topic>/
+├── scene1.png ... scene6.png     ← cropped 720x1280 images (REQUIRED)
+├── scene1.mp4 ... scene6.mp4    ← Sora-2 clips (OPTIONAL — auto-falls back to zoom on PNG)
+├── vo/
+│   └── vo1.wav ... vo6.wav       ← voice-over clips (REQUIRED)
+├── build/                        ← created automatically by stitch script
+└── final_<topic>.mp4             ← output
+```
+
+Create it at the start of every run:
+```bash
+mkdir -p runs/<topic>/vo
+```
+
+## Stage-gated workflow
+
+### Entry trigger
+Treat "do a videobob" or "make a TikTok video" as invoking this workflow.
+- Always start at Stage 1.
+- Read `references/hooks.md` and `references/science-facts.md` before proposing topics.
+
+---
+
+### Stage 1: Topic candidates
+1. Read `references/science-facts.md` for inspiration (or research any topic).
+2. Produce exactly 5 candidates. Each candidate = 1 hook line + 2 explainer lines.
+3. Score each using the rubric in `references/hooks.md`.
+4. Present all 5. **Wait for the user to pick one.**
+
+---
+
+### Stage 2: Script
+1. Read `references/tiktok-language-guidelines.md`.
+2. Write exactly 6 sentences. Each must be speakable in under 4 seconds.
+3. Word count per line: **7-10 words** (target 8-9). Hard max: **11 words** without explicit approval.
+4. Follow the narrative map: Hook → Setup → Twist → Stakes → Result → Cliffhanger question.
+5. **Wait for user approval.**
+
+---
+
+### Stage 2b: Voice-Over
+
+Generate 6 WAV files using OpenAI TTS. Save to the run directory.
+
+**⚠️ CRITICAL: Array indexing bug prevention.**
+When generating VO in a loop, use an **associative array** or explicit per-line curl calls. Do NOT use `$((i-1))` indexing in zsh (zsh arrays are 1-indexed, so `arr[0]` silently returns empty/wrong values). Proven-safe pattern:
+
+```bash
+# Use an associative array keyed by scene number (works in both bash and zsh):
+declare -A lines
+lines[1]="First script line here."
+lines[2]="Second script line here."
+lines[3]="Third script line here."
+lines[4]="Fourth script line here."
+lines[5]="Fifth script line here."
+lines[6]="Sixth script line here."
+
+for i in 1 2 3 4 5 6; do
+  curl -sS -X POST https://api.openai.com/v1/audio/speech \
+    -H "Authorization: Bearer $OPENAI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"tts-1\",\"input\":\"${lines[$i]}\",\"voice\":\"alloy\",\"speed\":1.0,\"response_format\":\"wav\"}" \
+    --output runs/<topic>/vo/vo${i}.wav
+done
+```
+
+**Validation (mandatory):** After generating all 6, verify EVERY file:
+```bash
+for i in 1 2 3 4 5 6; do
+  file runs/<topic>/vo/vo${i}.wav   # Must say "RIFF ... WAVE audio", NOT "JSON data"
+  ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 runs/<topic>/vo/vo${i}.wav
+done
+```
+
+- Each clip must be a valid WAV file (not a JSON error response).
+- Each clip must be **<= 4.8s** (allows 200ms padding to stay under the 5.0s scene cap).
+
+**If any clip is corrupted (JSON) or too long:** STOP. Regenerate the failing clip(s). If timing fails, rewrite the line to 7-9 words and regenerate ALL 6 clips (keeps cadence consistent). Do not proceed until all pass.
+
+Lock the script once VO passes.
+
+**Alternative: Local Voicebox TTS.** If a Voicebox server is running at `http://127.0.0.1:8000`, it can be used instead. See `references/voice-over-rules.md` for details.
+
+---
+
+### Stage 3+4: Images
+
+**Customizing the visual style:** The entire look of the video (color grading, lighting, mood, accent colors) is controlled by the `[STYLE:]` block in `references/image-rules.md`. Edit this file to match your brand or desired aesthetic. Every image prompt gets this style block prepended automatically, so changing it once applies to all scenes.
+
+1. Read `references/image-rules.md` for the visual style block.
+2. Write 6 image prompts (one per scene). Each describes the visual content; the style block is prepended automatically.
+3. Create `prompts.json` in the skill root:
+   ```json
+   {
+     "style": "<paste the entire [STYLE:] block from references/image-rules.md>",
+     "scenes": [
+       "Scene 1 visual description here",
+       "Scene 2 visual description here",
+       "Scene 3 visual description here",
+       "Scene 4 visual description here",
+       "Scene 5 visual description here",
+       "Scene 6 visual description here"
+     ]
+   }
+   ```
+4. Generate images (outputs `scene1.png` through `scene6.png` at 1024x1536):
+   ```bash
+   node scripts/generate-images.js --output runs/<topic>/ --prompts prompts.json
+   ```
+   **Note:** `gpt-image-1` only supports fixed sizes (1024x1024, 1536x1024, 1024x1536, or auto). 720x1280 cannot be generated directly; we generate at the closest portrait size (1024x1536) and crop.
+
+5. Crop to 720x1280 (modifies files in place):
+   ```bash
+   python3 scripts/crop_images.py runs/<topic>/
+   ```
+   The crop script scales to fit height (1280px), then **center-crops** the width from ~853px to 720px. This trims ~7.8% off each side. Keep important subjects away from the left/right edges in your prompts.
+
+   **Aspect ratio change:** 1024x1536 is 2:3 (0.667). 720x1280 is 9:16 (0.5625). The crop narrows the frame.
+
+6. Send all 6 images to the user for approval. **Wait for explicit approval before proceeding.**
+
+---
+
+### Stage 5+6: Video (Sora-2)
+
+For each scene, animate the cropped PNG using Sora-2.
+
+1. Read `references/video-prompt-rules.md` for prompt construction rules.
+2. For each scene (1-6), submit a video generation job using **multipart/form-data** with `input_reference`:
+
+   ```bash
+   # Step 1: Submit video job (image as multipart file upload)
+   curl -sS -X POST https://api.openai.com/v1/videos \
+     -H "Authorization: Bearer $OPENAI_API_KEY" \
+     -F "model=sora-2" \
+     -F "prompt=<animation prompt from video-prompt-rules.md>" \
+     -F "size=720x1280" \
+     -F "seconds=4" \
+     -F "input_reference=@runs/<topic>/scene1.png;type=image/png" \
+     > sora_job.json
+
+   # Step 2: Poll until complete (check every 30s)
+   JOB_ID=$(cat sora_job.json | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+   curl -sS https://api.openai.com/v1/videos/$JOB_ID \
+     -H "Authorization: Bearer $OPENAI_API_KEY"
+
+   # Step 3: Download when status is "completed"
+   curl -sS -L https://api.openai.com/v1/videos/$JOB_ID/content \
+     -H "Authorization: Bearer $OPENAI_API_KEY" \
+     --output runs/<topic>/scene1.mp4
+   ```
+
+   **API notes (verified 2026-03-11):**
+   - The `input_reference` parameter requires **multipart/form-data** (`-F` flags), NOT JSON body. Sending image data as JSON `input` returns `Unknown parameter: 'input'`.
+   - Use `seconds` (string: "4", "8", or "12"), NOT `duration` (rejected as unknown parameter).
+   - Supported sizes: `720x1280`, `1280x720`, `1024x1792`, `1792x1024`.
+   - The input image must match the target video resolution (720x1280). This is why we crop images BEFORE submitting to Sora-2.
+   - Sora-2 always generates videos **with audio** (ambient sound). There is no API parameter to disable this (tested: `audio`, `n_audio_channels` — both rejected). The stitch script strips this audio with `-an` during normalization and replaces it with the VO track.
+   - Submit all 6 jobs, then poll in a loop (every 30s). Typical render time: 1-3 minutes per scene.
+
+3. Save each clip as `runs/<topic>/scene1.mp4` through `runs/<topic>/scene6.mp4`.
+
+**Moderation fallback:** If a prompt is rejected, rewrite using neutral wording per `references/video-prompt-rules.md` and retry once. If still blocked, skip the MP4 for that scene. The stitch script will automatically use a Ken Burns zoom on the PNG instead.
+
+---
+
+### Stage 7 (optional): CTA Outro
+
+If the user wants a branded call-to-action clip appended to the end of the video:
+
+1. Ask the user to provide an outro video file (any resolution, any format ffmpeg can read).
+2. Save it as `assets/cta_outro.mp4` in the skill folder.
+3. The stitch script will detect it and append it automatically.
+
+If no `assets/cta_outro.mp4` exists, the video is produced without an outro. This is the default.
+
+---
+
+### Stage 8: Stitch & Deliver
+
+Run the stitch script:
+```bash
+node scripts/stitch-final.js \
+  --dir runs/<topic>/ \
+  --vo runs/<topic>/vo/ \
+  --out runs/<topic>/final_<topic>.mp4
+```
+
+The script:
+- Combines each scene's video (or PNG zoom fallback) with its VO clip
+- Re-encodes everything to h264/aac (30fps, 48kHz) for stable timestamps
+- Concatenates all 6 scenes using ffmpeg filter-complex (not raw concat)
+- Appends CTA outro if `assets/cta_outro.mp4` exists
+- Outputs the final MP4
+
+**After stitching:**
+1. Generate a high-CTR title for the video.
+2. Write a ~70-word Algo-optimized description.
+3. Deliver the final MP4, title, and description to the user.
+
+---
+
+## Defaults reference
+
+| Setting | Value |
+|---|---|
+| Language | English only |
+| Image model | `gpt-image-1` (OpenAI) |
+| Image generation size | 1024x1536 (2:3 portrait) — only fixed sizes supported |
+| Image crop target | 720x1280 (9:16) — center-crop, ~7.8% trimmed per side |
+| Video model | `sora-2` (4s clips via `seconds` param) |
+| Video API format | multipart/form-data with `input_reference` for image-to-video |
+| TTS model | `tts-1` with voice `alloy` at speed 1.0 |
+| Max scene duration | 5.0s (100ms lead + VO + 100ms tail) |
+| Output resolution | 720x1280 (9:16) |
+| Output codec | h264 + aac, 30fps, 48kHz |
+
+## Known pitfalls
+
+- **zsh array indexing:** zsh arrays are 1-indexed. Never use `arr[$((i-1))]` to access elements. Use `declare -A` associative arrays or direct `arr[$i]` with 1-based keys.
+- **VO corruption:** If a TTS call gets an empty or invalid input, it returns a JSON error body saved as `.wav`. Always validate with `file vo*.wav` before proceeding.
+- **Sora-2 API format:** The video creation endpoint does NOT accept JSON body for image input. Use multipart/form-data with `-F input_reference=@file.png;type=image/png`.
+- **Sora-2 parameter names:** Use `seconds` (not `duration`), `input_reference` (not `input`). Wrong names return 400 errors.
